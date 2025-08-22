@@ -21,16 +21,15 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
-  char name[8];
 } kmem[NCPU];
-
-#define BATCH_SIZE 3
 void
 kinit()
 {
-  for(int i=0;i<NCPU;i++){
-    snprintf(kmem[i].name, 6, "kmem%d", i);
-    initlock(&kmem[i].lock, kmem[i].name);
+  char buf[10];
+  for (int i = 0; i < NCPU; i++)
+  {
+    snprintf(buf, 10, "kmem_CPU%d", i);
+    initlock(&kmem[i].lock, buf);
   }
   freerange(end, (void*)PHYSTOP);
 }
@@ -38,13 +37,17 @@ kinit()
 void
 freerange(void *pa_start, void *pa_end)
 {
+  push_off();
+
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
     kfree(p);
+  
+  pop_off();
 }
 
-// Free the page of physical memory pointed at by pa,
+// Free the page of physical memory pointed at by v,
 // which normally should have been returned by a
 // call to kalloc().  (The exception is when
 // initializing the allocator; see kinit above.)
@@ -60,15 +63,14 @@ kfree(void *pa)
   memset(pa, 1, PGSIZE);
 
   r = (struct run*)pa;
+
   push_off();
-  int cpu_id = cpuid();
-  acquire(&kmem[cpu_id].lock);
-  r->next = kmem[cpu_id].freelist;
-  kmem[cpu_id].freelist = r;
-  // if(cpu_id)
-  //   printf("kfree in cpuid %d\n",cpu_id);
-  release(&kmem[cpu_id].lock);
+  int cpu = cpuid();
   pop_off();
+  acquire(&kmem[cpu].lock);
+  r->next = kmem[cpu].freelist;
+  kmem[cpu].freelist = r;
+  release(&kmem[cpu].lock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -77,98 +79,47 @@ kfree(void *pa)
 void *
 kalloc(void)
 {
-  struct run *r;//,*fast, *slow;
-  //struct run *head;
-  struct run *tail;
-  //int count;
+  struct run *r;
+
   push_off();
-  int cpu_id=cpuid();
+  int cpu = cpuid();
   pop_off();
-  acquire(&kmem[cpu_id].lock);
-  r = kmem[cpu_id].freelist;
-  if(r){
-    kmem[cpu_id].freelist = r->next;
-    release(&kmem[cpu_id].lock);
-    }
-  else{
-    release(&kmem[cpu_id].lock);
-    //printf("cpu id %d freelist empty ",cpu_id);
-    int i=(cpu_id+1)%NCPU;
-    for(;i!=cpu_id;i=(i+1)%NCPU){
-    // for (int i = 0; i <NCPU; i++)
-    // {
-    //   if(i==cpu_id){continue;}
 
-      // steal half everytime
-      // acquire(&kmem[i].lock);
-      // r = kmem[i].freelist;
-      // if(r){
-      //   fast=r;
-      //   slow=r;
-      //   while(fast && fast->next){
-      //     slow=slow->next;
-      //     fast=fast->next->next;
-      //   }
-      //   kmem[i].freelist = slow->next;
-
-      //   release(&kmem[i].lock);
-      //   slow->next = 0;
-      //   acquire(&kmem[cpu_id].lock);
-      //   kmem[cpu_id].freelist = r->next;
-      //   release(&kmem[cpu_id].lock);
-      //   break;
-      // }
-      // release(&kmem[i].lock);
-
-      // release(&kmem[i].lock);
-      // memset((char *)r, 5, PGSIZE); // fill with junk
-      // return (void *)r;
-
-      //steal one everytime
-      // acquire(&kmem[i].lock);
-      // r = kmem[i].freelist;
-      // if(r){
-      //   kmem[i].freelist=r->next;
-      //   release(&kmem[i].lock);
-      //   break;
-      // }
-      // release(&kmem[i].lock);
-
-      //steal 2 or 3 everytime
+  acquire(&kmem[cpu].lock);
+  r = kmem[cpu].freelist;
+  if(r)
+    kmem[cpu].freelist = r->next;
+  else // steal page from other CPU
+  {
+    struct run* tmp;
+    for (int i = 0; i < NCPU; ++i)
+    {
+      if (i == cpu) continue;
       acquire(&kmem[i].lock);
-      if (kmem[i].freelist)
-      {
-        //printf("malloced from cpuid %d.\n",i);
-        // Steal multiple pages in one go
-        r = kmem[i].freelist;
-        tail = r;
-        // count = 1;
-
-        // // Find a few pages to steal (e.g., 2-3 pages)
-        //change while to for improves the performance??
-        // while (count < BATCH_SIZE && tail->next)
-        // {
-        //   tail = tail->next;
-        //   count++;
-        // }
-        for(int count=1;count < BATCH_SIZE && tail->next;count++){
-          tail = tail->next;
-        }
-        // Detach stolen pages from source CPU
-        kmem[i].freelist = tail->next;
+      tmp = kmem[i].freelist;
+      if (tmp == 0) {
         release(&kmem[i].lock);
-        tail->next = 0;
-
-        // Add to local freelist
-        acquire(&kmem[cpu_id].lock);
-         // First page to return
-        kmem[cpu_id].freelist = r->next;
-        release(&kmem[cpu_id].lock);
+        continue;
+      } else {
+        for (int j = 0; j < 1024; j++) {
+          // steal 1024 pages
+          if (tmp->next)
+            tmp = tmp->next;
+          else
+            break;
+        }
+        kmem[cpu].freelist = kmem[i].freelist;
+        kmem[i].freelist = tmp->next;
+        tmp->next = 0;
+        release(&kmem[i].lock);
         break;
       }
-      release(&kmem[i].lock);
     }
+    r = kmem[cpu].freelist;
+    if (r)
+      kmem[cpu].freelist = r->next;
   }
+  release(&kmem[cpu].lock);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
