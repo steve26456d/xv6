@@ -16,6 +16,45 @@
 #include "file.h"
 #include "fcntl.h"
 
+#define NSYMLINK 10
+
+static struct inode* find_target(struct inode* ip) {
+  uint inums[NSYMLINK];
+  int i, j;
+  char target[MAXPATH];
+
+  for(i = 0; i < NSYMLINK; ++i) {
+    inums[i] = ip->inum;
+    // read the target path from symlink file
+    if(readi(ip, 0, (uint64)target, 0, MAXPATH) <= 0) {
+      iunlockput(ip);
+      printf("find_target: open symlink failed\n");
+      return 0;
+    }
+    iunlockput(ip);
+    
+    // get the inode of target path 
+    if((ip = namei(target)) == 0) {
+      printf("find_target: path \"%s\" is not exist\n", target);
+      return 0;
+    }
+    for(j = 0; j <= i; ++j) {
+      if(ip->inum == inums[j]) {
+        printf("find_target: links form a cycle\n");
+        return 0;
+      }
+    }
+    ilock(ip);
+    if(ip->type != T_SYMLINK) {
+      return ip;
+    }
+  }
+
+  iunlockput(ip);
+  printf("open_symlink: the depth of links reaches the limit\n");
+  return 0;
+}
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -301,31 +340,6 @@ create(char *path, short type, short major, short minor)
   return 0;
 }
 
-struct inode*
-open_symlink(struct inode* ip){
-  int count=0;
-  char target[MAXPATH];
-  struct inode* dp=ip;
-  while (dp->type == T_SYMLINK)
-  {
-    if (readi(dp, 0, (uint64)&target, 0, sizeof(target)) != sizeof(target)||count>10)
-    {
-      iunlockput(dp);
-      end_op();
-      return 0;
-    }
-    iunlockput(dp);
-    dp=namei(target);
-    if(dp==0){
-      end_op();
-      return 0;
-    }
-    count++;
-    ilock(dp);
-  }
-  return dp;
-}
-
 uint64
 sys_open(void)
 {
@@ -333,7 +347,6 @@ sys_open(void)
   int fd, omode;
   struct file *f;
   struct inode *ip;
-  //struct inode *dp;
   int n;
 
   argint(1, &omode);
@@ -354,18 +367,6 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    if((omode& O_NOFOLLOW)==0 && ip->type==T_SYMLINK){
-      // if( (dp=open_symlink(ip))){
-      //   iunlockput(dp);
-      //   ip=dp;
-      //   ilock(ip);
-      // }
-      // else{
-      //   return -1;
-      // }
-      if ((ip = open_symlink(ip))==0)
-        {return -1;}
-    }
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -377,6 +378,13 @@ sys_open(void)
     iunlockput(ip);
     end_op();
     return -1;
+  }
+
+  if(ip->type == T_SYMLINK && (omode & O_NOFOLLOW) == 0) {
+    if((ip = find_target(ip)) == 0) {
+      end_op();
+      return -1;
+    }
   }
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
@@ -541,36 +549,30 @@ sys_pipe(void)
   }
   return 0;
 }
-
-// syscall for int symlink(char *target, char *path);
-uint64
-sys_symlink(void){
-  char path[MAXPATH];
-  char target[MAXPATH];
+// int symlink(char* target , char* path)
+uint64 sys_symlink(void) {
+  char target[MAXPATH], path[MAXPATH];
   struct inode *ip;
+  int n;
+
+  if ((n = argstr(0, target, MAXPATH)) < 0
+    || argstr(1, path, MAXPATH) < 0) {
+    return -1;
+  }
 
   begin_op();
-  if (argstr(0, target, MAXPATH) < 0||argstr(1, path, MAXPATH) < 0 || (ip = create(path, T_SYMLINK, 0, 0)) == 0)
-  {
+  // create the symlink's inode
+  if((ip = create(path, T_SYMLINK, 0, 0)) == 0) {
     end_op();
     return -1;
   }
-  //ip and path. this is already done in create?
-  // if ((dp = nameiparent(path, name)) == 0)
-  //   goto bad;
-  // ilock(dp);
-  // if (dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0)
-  // {
-  //   iunlockput(dp);
-  //   goto bad;
-  // }
-  //ip content writei
-  if (writei(ip, 0, (uint64)&target, 0, sizeof(target)) != sizeof(target))
-  {
+  // write the target path to the inode
+  if(writei(ip, 0, (uint64)target, 0, n) != n) {
     iunlockput(ip);
     end_op();
     return -1;
   }
+
   iunlockput(ip);
   end_op();
   return 0;
